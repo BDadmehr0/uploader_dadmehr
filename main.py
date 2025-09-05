@@ -14,7 +14,7 @@ logging.basicConfig(
 )
 
 BOT_TOKEN = "8339151235:AAHWAVBU0E0BFS9OGncjYXQwdU8XqHY83aQ"
-ADMIN_IDS = [2120880112]
+ADMIN_IDS = [2120880112, 6357014606]
 DEFAULT_SELF_DESTRUCT_TIME = 15
 
 def init_db():
@@ -365,6 +365,18 @@ async def prompt_user_to_join_channels(update: Update, context, required_channel
         "⚠️ برای دسترسی به این فایل ابتدا باید عضو چنل‌های مشخص شده شوید.",
         reply_markup=reply_markup,
     )
+
+import aiohttp
+
+async def check_membership_via_api(user_id: int) -> bool:
+    url = "http://127.0.0.1:8000/check_user"
+    headers = {"x-api-key": "supersecret"}
+    payload = {"user_id": user_id}
+
+    async with aiohttp.ClientSession() as session:
+        async with session.post(url, json=payload, headers=headers) as resp:
+            data = await resp.json()
+            return data.get("status") == "yes"
 
 
 async def handle_check_channels(update: Update, context):
