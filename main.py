@@ -335,31 +335,10 @@ async def check_user_channels(user_id, required_channels, context):
     return True
 
 
-async def prompt_user_to_join_channels(update: Update, context, required_channels):
-    """
-    نمایش پیام هشدار با دکمه‌ها فقط یک بار
-    """
-    # اگر قبلاً پیام هشدار ارسال شده بود، چیزی نفرست
-    if context.user_data.get("prompt_message_sent"):
-        return
 
-    keyboard = [
-        [InlineKeyboardButton(f"🔗 {ch}", url=f"https://t.me/{ch.lstrip('@')}")] 
-        for ch in required_channels
-    ]
-    keyboard.append([InlineKeyboardButton("✅ چک دوباره عضویت", callback_data="check_channels")])
-    reply_markup = InlineKeyboardMarkup(keyboard)
 
-    # تشخیص نوع update
-    message = update.callback_query.message if update.callback_query else update.message
 
-    await message.reply_text(
-        "⚠️ برای دسترسی به این فایل ابتدا باید عضو چنل‌های مشخص شده شوید.",
-        reply_markup=reply_markup,
-    )
 
-    # ثبت اینکه پیام هشدار ارسال شده
-    context.user_data["prompt_message_sent"] = True
 
 
 async def check_membership_via_api(user_id: int, channels: list[str]) -> bool:
@@ -379,17 +358,76 @@ async def check_membership_via_api(user_id: int, channels: list[str]) -> bool:
                 return False  # خطا در ارتباط با API
             data = await resp.json()
             return data.get("status") == "yes"
+        
 
+
+
+
+
+
+async def delete_prompt_after_delay(context, chat_id, message_id, delay=15):
+    """حذف پیام درخواست عضویت پس از تاخیر مشخص"""
+    try:
+        await asyncio.sleep(delay)
+        await context.bot.delete_message(chat_id=chat_id, message_id=message_id)
+        
+        # پاک کردن فقط اطلاعات پیام prompt از context، نه اطلاعات entity
+        if "prompt_message_id" in context.user_data:
+            context.user_data.pop("prompt_message_id", None)
+        if "prompt_chat_id" in context.user_data:
+            context.user_data.pop("prompt_chat_id", None)
+        if "prompt_message_sent" in context.user_data:
+            context.user_data.pop("prompt_message_sent", None)
+            
+    except Exception as e:
+        logging.error(f"Error deleting prompt message: {e}")
+
+async def prompt_user_to_join_channels(update: Update, context, required_channels):
+    """
+    نمایش پیام هشدار با دکمه‌ها فقط یک بار
+    """
+    # اگر قبلاً پیام هشدار ارسال شده بود، چیزی نفرست
+    if context.user_data.get("prompt_message_sent"):
+        return
+
+    keyboard = [
+        [InlineKeyboardButton(f"🔗 {ch}", url=f"https://t.me/{ch.lstrip('@')}")] 
+        for ch in required_channels
+    ]
+    keyboard.append([InlineKeyboardButton("✅ چک دوباره عضویت", callback_data="check_channels")])
+    reply_markup = InlineKeyboardMarkup(keyboard)
+
+    # تشخیص نوع update
+    if update.callback_query:
+        message = update.callback_query.message
+    else:
+        message = update.message
+
+    sent_msg = await message.reply_text(
+        "⚠️ برای دسترسی به این فایل ابتدا باید عضو چنل‌های مشخص شده شوید.\n\n"
+        "⏰ این پیام به طور خودکار پس از 15 ثانیه حذف خواهد شد.",
+        reply_markup=reply_markup,
+    )
+
+    # ثبت اینکه پیام هشدار ارسال شده و ذخیره ID آن
+    context.user_data["prompt_message_sent"] = True
+    context.user_data["prompt_message_id"] = sent_msg.message_id
+    context.user_data["prompt_chat_id"] = sent_msg.chat.id
+
+    # شروع تایمر برای حذف خودکار پیام
+    asyncio.create_task(delete_prompt_after_delay(context, sent_msg.chat.id, sent_msg.message_id))
 
 async def handle_check_channels(update: Update, context):
     query = update.callback_query
+    await query.answer()
     user_id = query.from_user.id
 
-    if "lock_entity" not in context.user_data:
+    # بازیابی اطلاعات entity از context (اگر وجود دارد)
+    entity_info = context.user_data.get("lock_entity")
+    if not entity_info:
         await query.answer("❌ خطا: اطلاعات فایل یا آرشیو یافت نشد.", show_alert=True)
         return
 
-    entity_info = context.user_data["lock_entity"]
     required_channels = get_required_channels(entity_info["type"], entity_info["id"])
 
     # بررسی عضویت
@@ -398,11 +436,26 @@ async def handle_check_channels(update: Update, context):
     if is_member:
         await query.answer("✅ شما اکنون عضو همه چنل‌های لازم هستید.", show_alert=True)
 
-        # حذف پیام قبلی (پیام درخواست عضویت با دکمه‌های شیشه‌ای)
+        # حذف پیام درخواست عضویت (اگر وجود دارد)
+        if "prompt_message_id" in context.user_data and "prompt_chat_id" in context.user_data:
+            try:
+                await context.bot.delete_message(
+                    chat_id=context.user_data["prompt_chat_id"],
+                    message_id=context.user_data["prompt_message_id"]
+                )
+            except Exception as e:
+                logging.error(f"Error deleting prompt message: {e}")
+
+        # حذف پیام اصلی که حاوی دکمه‌هاست (پیام callback)
         try:
             await query.message.delete()
         except Exception as e:
-            logging.error(f"Error deleting message: {e}")
+            logging.error(f"Error deleting query message: {e}")
+
+        # پاک کردن فقط اطلاعات پیام prompt از context، نه اطلاعات entity
+        context.user_data.pop("prompt_message_id", None)
+        context.user_data.pop("prompt_chat_id", None)
+        context.user_data.pop("prompt_message_sent", None)
 
         # ارسال فایل یا آرشیو
         conn = sqlite3.connect("file_bot.db")
@@ -416,17 +469,25 @@ async def handle_check_channels(update: Update, context):
             if file_data:
                 await send_single_file(update, context, file_data)
             else:
-                await query.answer("❌ فایل مورد نظر یافت نشد.", show_alert=True)
+                # اگر فایل پیدا نشد، همچنان اطلاعات entity را حفظ نکن
+                context.user_data.pop("lock_entity", None)
+                await query.message.reply_text("❌ فایل مورد نظر یافت نشد.")
         elif entity_info["type"] == "archive":
             cursor.execute("SELECT archive_code FROM archives WHERE id = ?", (entity_info["id"],))
             archive_row = cursor.fetchone()
             if archive_row:
                 await send_archive_files(update, context, archive_row[0])
             else:
-                await query.answer("❌ آرشیو مورد نظر یافت نشد.", show_alert=True)
+                # اگر آرشیو پیدا نشد، همچنان اطلاعات entity را حفظ نکن
+                context.user_data.pop("lock_entity", None)
+                await query.message.reply_text("❌ آرشیو مورد نظر یافت نشد.")
         conn.close()
+        
+        # پس از ارسال محتوا، اطلاعات entity را پاک کنید
+        context.user_data.pop("lock_entity", None)
+        
     else:
-        # نمایش alert فوری بدون ایجاد پیام جدید
+        # نمایش alert فوری
         await query.answer(
             "⚠️ هنوز عضو همه چنل‌ها نیستید. لطفاً ابتدا عضو شوید و دوباره تلاش کنید.",
             show_alert=True
@@ -435,7 +496,24 @@ async def handle_check_channels(update: Update, context):
         # فقط اگر پیام هشدار اصلی هنوز وجود ندارد، پیام با دکمه‌ها را بفرست
         if not context.user_data.get("prompt_message_sent"):
             await prompt_user_to_join_channels(update, context, required_channels)
-            context.user_data["prompt_message_sent"] = True
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 
 
 async def show_file_settings(query):
