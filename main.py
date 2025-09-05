@@ -9,6 +9,9 @@ from telegram import (InlineKeyboardButton, InlineKeyboardMarkup,
 from telegram.ext import (Application, CallbackQueryHandler, CommandHandler,
                           ContextTypes, MessageHandler, filters)
 
+import aiohttp
+
+
 logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s", level=logging.INFO
 )
@@ -364,61 +367,62 @@ async def prompt_user_to_join_channels(update: Update, context, required_channel
     await update.message.reply_text(
         "⚠️ برای دسترسی به این فایل ابتدا باید عضو چنل‌های مشخص شده شوید.",
         reply_markup=reply_markup,
+        protect_content=True
     )
 
-import aiohttp
 
-async def check_membership_via_api(user_id: int) -> bool:
+async def check_membership_via_api(user_id: int, channels: list[str]) -> bool:
+    """
+    بررسی عضویت کاربر در کانال‌ها با تماس به secure_bot API
+    """
     url = "http://127.0.0.1:8000/check_user"
     headers = {"x-api-key": "supersecret"}
-    payload = {"user_id": user_id}
+    payload = {
+        "user_id": user_id,
+        "channels": channels
+    }
+    print(channels, user_id)
 
     async with aiohttp.ClientSession() as session:
         async with session.post(url, json=payload, headers=headers) as resp:
+            if resp.status != 200:
+                return False  # خطا در ارتباط با API
             data = await resp.json()
             return data.get("status") == "yes"
 
 
-async def handle_check_channels(update: Update, context):
+async def handle_check_channels(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """
+    هندلر دکمه 'چک دوباره عضویت' برای فایل یا آرشیو
+    """
     query = update.callback_query
-    user_id = query.from_user.id
     await query.answer()
+    user_id = query.from_user.id
 
-    # اگر lock_entity موجود نیست
+    # بررسی اینکه lock_entity وجود دارد
     if "lock_entity" not in context.user_data:
         await query.answer("❌ خطا: اطلاعات فایل یا آرشیو یافت نشد.", show_alert=True)
         return
 
     entity_info = context.user_data["lock_entity"]
+    # دریافت لیست کانال‌های مورد نیاز از DB
     required_channels = get_required_channels(entity_info["type"], entity_info["id"])
 
-    # حذف پیام قبلی (پیام هشدار)
-    try:
-        await query.message.delete()
-    except Exception as e:
-        logging.error(f"Error deleting message: {e}")
-
-    # بررسی عضویت کاربر
-    is_member = await check_user_channels(user_id, required_channels, context)
+    if not required_channels:
+        # اگر کانالی برای چک وجود ندارد، مستقیماً اجازه بده
+        is_member = True
+    else:
+        # بررسی عضویت async از طریق secure_bot API
+        is_member = await check_membership_via_api(user_id, required_channels)
 
     if is_member:
-        # پیام موقت موفقیت
-        success_msg = await query.message.reply_text(
-            "✅ شما اکنون عضو همه چنل‌های لازم هستید. در حال ارسال فایل...",
-            protect_content=True
-        )
+        # ✅ اگر عضو همه کانال‌ها بود، پیام هشدار را پاک کن
+        try:
+            await query.message.delete()
+        except Exception as e:
+            logging.error(f"Error deleting message: {e}")
 
-        # تخریب خودکار پیام موفقیت پس از 10 ثانیه
-        asyncio.create_task(
-            self_destruct_messages(
-                query.message.chat_id,
-                [success_msg.message_id],
-                context,
-                10
-            )
-        )
-
-        # اگر فایل تکی بود
+        # ادامه ارسال فایل یا آرشیو
         if entity_info["type"] == "file":
             conn = sqlite3.connect("file_bot.db")
             cursor = conn.cursor()
@@ -437,13 +441,11 @@ async def handle_check_channels(update: Update, context):
             else:
                 await query.answer("❌ فایل مورد نظر یافت نشد.", show_alert=True)
 
-        # اگر آرشیو بود
         elif entity_info["type"] == "archive":
             conn = sqlite3.connect("file_bot.db")
             cursor = conn.cursor()
             cursor.execute(
-                "SELECT archive_code FROM archives WHERE id = ?",
-                (entity_info["id"],),
+                "SELECT archive_code FROM archives WHERE id = ?", (entity_info["id"],)
             )
             archive_row = cursor.fetchone()
             conn.close()
@@ -455,24 +457,9 @@ async def handle_check_channels(update: Update, context):
                 await query.answer("❌ آرشیو مورد نظر یافت نشد.", show_alert=True)
 
     else:
-        # پیام موقت خطا
-        error_msg = await query.message.reply_text(
-            "⚠️ هنوز عضو همه چنل‌ها نیستید. لطفاً ابتدا عضو شوید و دوباره تلاش کنید.",
-            protect_content=True
-        )
+        # ⚠️ اگر عضو همه کانال‌ها نبود، پیام هشدار با دکمه‌ها بده
+        await prompt_user_to_join_channels(query, context, required_channels)
 
-        # تخریب خودکار پیام خطا پس از 10 ثانیه
-        asyncio.create_task(
-            self_destruct_messages(
-                query.message.chat_id,
-                [error_msg.message_id],
-                context,
-                10
-            )
-        )
-
-        # نمایش مجدد پیام هشدار اصلی
-        await prompt_user_to_join_channels(update, context, required_channels)
 
 
 async def show_file_settings(query):
