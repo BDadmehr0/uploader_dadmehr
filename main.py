@@ -1042,11 +1042,11 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await send_single_file(update, context, file_data)
 
             if self_destruct:
-                warning_msg = (
-                    f"⚠️ این فایل دارای تخریب خودکار است!\n\n"
-                    "📌 لطفاً بلافاصله فایل را به Saved Messages خود منتقل کنید تا از دست نرود."
-                )
-                await update.message.reply_text(warning_msg)
+                # warning_msg = (
+                #     f"⚠️ این فایل دارای تخریب خودکار است!\n\n"
+                #     "📌 لطفاً بلافاصله فایل را به Saved Messages خود منتقل کنید تا از دست نرود."
+                # )
+                pass
         else:
             await update.message.reply_text("❌ فایل مورد نظر یافت نشد.")
 
