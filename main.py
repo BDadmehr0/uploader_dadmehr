@@ -3,14 +3,12 @@ import logging
 import pickle
 import sqlite3
 import uuid
+import aiohttp
 
 from telegram import (InlineKeyboardButton, InlineKeyboardMarkup,
                       KeyboardButton, ReplyKeyboardMarkup, Update)
 from telegram.ext import (Application, CallbackQueryHandler, CommandHandler,
                           ContextTypes, MessageHandler, filters)
-
-import aiohttp
-
 
 logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s", level=logging.INFO
@@ -350,25 +348,29 @@ async def check_user_channels(user_id, required_channels, context):
 
 async def prompt_user_to_join_channels(update: Update, context, required_channels):
     """
-    نمایش پیام هشدار برای کاربر که باید عضو چنل‌ها شود
-    همراه با دکمه‌های شیشه‌ای برای رفتن به چنل‌ها و چک دوباره عضویت
+    نمایش پیام هشدار با دکمه‌ها فقط یک بار
     """
-    keyboard = []
-    for ch in required_channels:
-        keyboard.append(
-            [InlineKeyboardButton(f"🔗 {ch}", url=f"https://t.me/{ch.lstrip('@')}")]
-        )
+    # اگر قبلاً پیام هشدار ارسال شده بود، چیزی نفرست
+    if context.user_data.get("prompt_message_sent"):
+        return
 
-    keyboard.append(
-        [InlineKeyboardButton("✅ چک دوباره عضویت", callback_data="check_channels")]
-    )
+    keyboard = [
+        [InlineKeyboardButton(f"🔗 {ch}", url=f"https://t.me/{ch.lstrip('@')}")] 
+        for ch in required_channels
+    ]
+    keyboard.append([InlineKeyboardButton("✅ چک دوباره عضویت", callback_data="check_channels")])
     reply_markup = InlineKeyboardMarkup(keyboard)
 
-    await update.message.reply_text(
+    # تشخیص نوع update
+    message = update.callback_query.message if update.callback_query else update.message
+
+    await message.reply_text(
         "⚠️ برای دسترسی به این فایل ابتدا باید عضو چنل‌های مشخص شده شوید.",
         reply_markup=reply_markup,
-        protect_content=True
     )
+
+    # ثبت اینکه پیام هشدار ارسال شده
+    context.user_data["prompt_message_sent"] = True
 
 
 async def check_membership_via_api(user_id: int, channels: list[str]) -> bool:
@@ -381,7 +383,6 @@ async def check_membership_via_api(user_id: int, channels: list[str]) -> bool:
         "user_id": user_id,
         "channels": channels
     }
-    print(channels, user_id)
 
     async with aiohttp.ClientSession() as session:
         async with session.post(url, json=payload, headers=headers) as resp:
@@ -391,75 +392,55 @@ async def check_membership_via_api(user_id: int, channels: list[str]) -> bool:
             return data.get("status") == "yes"
 
 
-async def handle_check_channels(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """
-    هندلر دکمه 'چک دوباره عضویت' برای فایل یا آرشیو
-    """
+async def handle_check_channels(update: Update, context):
     query = update.callback_query
-    await query.answer()
     user_id = query.from_user.id
 
-    # بررسی اینکه lock_entity وجود دارد
     if "lock_entity" not in context.user_data:
         await query.answer("❌ خطا: اطلاعات فایل یا آرشیو یافت نشد.", show_alert=True)
         return
 
     entity_info = context.user_data["lock_entity"]
-    # دریافت لیست کانال‌های مورد نیاز از DB
     required_channels = get_required_channels(entity_info["type"], entity_info["id"])
 
-    if not required_channels:
-        # اگر کانالی برای چک وجود ندارد، مستقیماً اجازه بده
-        is_member = True
-    else:
-        # بررسی عضویت async از طریق secure_bot API
-        is_member = await check_membership_via_api(user_id, required_channels)
+    # بررسی عضویت
+    is_member = await check_membership_via_api(user_id, required_channels)
 
     if is_member:
-        # ✅ اگر عضو همه کانال‌ها بود، پیام هشدار را پاک کن
-        try:
-            await query.message.delete()
-        except Exception as e:
-            logging.error(f"Error deleting message: {e}")
+        await query.answer("✅ شما اکنون عضو همه چنل‌های لازم هستید.", show_alert=True)
 
-        # ادامه ارسال فایل یا آرشیو
+        # ارسال فایل یا آرشیو
+        conn = sqlite3.connect("file_bot.db")
+        cursor = conn.cursor()
         if entity_info["type"] == "file":
-            conn = sqlite3.connect("file_bot.db")
-            cursor = conn.cursor()
             cursor.execute(
-                """
-                SELECT id, file_id, file_name, file_type, caption, caption_entities, self_destruct
-                FROM files WHERE id = ?
-                """,
+                "SELECT id, file_id, file_name, file_type, caption, caption_entities, self_destruct FROM files WHERE id = ?",
                 (entity_info["id"],),
             )
             file_data = cursor.fetchone()
-            conn.close()
-
             if file_data:
                 await send_single_file(update, context, file_data)
             else:
                 await query.answer("❌ فایل مورد نظر یافت نشد.", show_alert=True)
-
         elif entity_info["type"] == "archive":
-            conn = sqlite3.connect("file_bot.db")
-            cursor = conn.cursor()
-            cursor.execute(
-                "SELECT archive_code FROM archives WHERE id = ?", (entity_info["id"],)
-            )
+            cursor.execute("SELECT archive_code FROM archives WHERE id = ?", (entity_info["id"],))
             archive_row = cursor.fetchone()
-            conn.close()
-
             if archive_row:
-                archive_code = archive_row[0]
-                await send_archive_files(update, context, archive_code)
+                await send_archive_files(update, context, archive_row[0])
             else:
                 await query.answer("❌ آرشیو مورد نظر یافت نشد.", show_alert=True)
-
+        conn.close()
     else:
-        # ⚠️ اگر عضو همه کانال‌ها نبود، پیام هشدار با دکمه‌ها بده
-        await prompt_user_to_join_channels(query, context, required_channels)
+        # نمایش alert فوری بدون ایجاد پیام جدید
+        await query.answer(
+            "⚠️ هنوز عضو همه چنل‌ها نیستید. لطفاً ابتدا عضو شوید و دوباره تلاش کنید.",
+            show_alert=True
+        )
 
+        # فقط اگر پیام هشدار اصلی هنوز وجود ندارد، پیام با دکمه‌ها را بفرست
+        if not context.user_data.get("prompt_message_sent"):
+            await prompt_user_to_join_channels(update, context, required_channels)
+            context.user_data["prompt_message_sent"] = True
 
 
 async def show_file_settings(query):
