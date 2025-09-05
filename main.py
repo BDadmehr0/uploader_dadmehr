@@ -398,6 +398,12 @@ async def handle_check_channels(update: Update, context):
     if is_member:
         await query.answer("✅ شما اکنون عضو همه چنل‌های لازم هستید.", show_alert=True)
 
+        # حذف پیام قبلی (پیام درخواست عضویت با دکمه‌های شیشه‌ای)
+        try:
+            await query.message.delete()
+        except Exception as e:
+            logging.error(f"Error deleting message: {e}")
+
         # ارسال فایل یا آرشیو
         conn = sqlite3.connect("file_bot.db")
         cursor = conn.cursor()
