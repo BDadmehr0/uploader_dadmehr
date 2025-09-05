@@ -257,38 +257,27 @@ async def handle_simple_lock(query, data, context):
     )
 
 async def prompt_user_to_join_channels(update: Update, context, required_channels):
-    """
-    نمایش پیام هشدار برای کاربر که باید عضو چنل‌ها شود
-    همراه با دکمه‌های شیشه‌ای برای رفتن به چنل‌ها و چک دوباره عضویت
-    """
-    keyboard = []
-    for ch in required_channels:
-        keyboard.append(
-            [InlineKeyboardButton(f"🔗 {ch}", url=f"https://t.me/{ch.lstrip('@')}")]
-        )
+    # اگر قبلاً پیام هشدار ارسال شده بود، چیزی نفرست
+    if context.user_data.get("prompt_message_id"):
+        return
 
-    keyboard.append(
-        [InlineKeyboardButton("✅ چک دوباره عضویت", callback_data="check_channels")]
-    )
+    keyboard = [
+        [InlineKeyboardButton(f"🔗 {ch}", url=f"https://t.me/{ch.lstrip('@')}")] 
+        for ch in required_channels
+    ]
+    keyboard.append([InlineKeyboardButton("✅ چک دوباره عضویت", callback_data="check_channels")])
     reply_markup = InlineKeyboardMarkup(keyboard)
 
-    # ارسال پیام با قابلیت عدم فوروارد
-    warning_msg = await update.message.reply_text(
-        "⚠️ برای دسترسی به این فایل ابتدا باید عضو چنل‌های مشخص شده شوید.\n\n"
-        "✅ پس از عضویت، روی دکمه 'چک دوباره عضویت' کلیک کنید.",
+    message = update.callback_query.message if update.callback_query else update.message
+
+    sent_msg = await message.reply_text(
+        "⚠️ برای دسترسی به این فایل ابتدا باید عضو چنل‌های مشخص شده شوید.",
         reply_markup=reply_markup,
-        protect_content=True  # جلوگیری از فوروارد
     )
 
-    # تخریب خودکار پیام پس از 60 ثانیه
-    asyncio.create_task(
-        self_destruct_messages(
-            update.effective_chat.id,
-            [warning_msg.message_id],
-            context,
-            60  # 60 ثانیه
-        )
-    )
+    # ذخیره ID پیام هشدار برای حذف بعدی
+    context.user_data["prompt_message_id"] = sent_msg.message_id
+
 
 
 async def handle_channels_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
