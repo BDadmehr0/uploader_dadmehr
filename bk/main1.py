@@ -7,10 +7,21 @@ import sqlite3
 import uuid
 from datetime import datetime
 
-from telegram import (InlineKeyboardButton, InlineKeyboardMarkup,
-                      KeyboardButton, ReplyKeyboardMarkup, Update)
-from telegram.ext import (Application, CallbackQueryHandler, CommandHandler,
-                          ContextTypes, MessageHandler, filters)
+from telegram import (
+    InlineKeyboardButton,
+    InlineKeyboardMarkup,
+    KeyboardButton,
+    ReplyKeyboardMarkup,
+    Update,
+)
+from telegram.ext import (
+    Application,
+    CallbackQueryHandler,
+    CommandHandler,
+    ContextTypes,
+    MessageHandler,
+    filters,
+)
 
 # تنظیمات لاگ
 logging.basicConfig(

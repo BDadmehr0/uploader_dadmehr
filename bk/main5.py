@@ -3,6 +3,8 @@ import logging
 import pickle
 import sqlite3
 import uuid
+import aiohttp
+import re
 
 from telegram import (
     InlineKeyboardButton,
@@ -10,6 +12,9 @@ from telegram import (
     KeyboardButton,
     ReplyKeyboardMarkup,
     Update,
+    InputMediaPhoto,
+    InputMediaVideo,
+    InputMediaDocument,
 )
 from telegram.ext import (
     Application,
@@ -24,15 +29,17 @@ logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s", level=logging.INFO
 )
 
-BOT_TOKEN = "8446001136:AAFEZ3hNbVze4zYPSJE9MIalR0wPHu448sc"
-ADMIN_IDS = 2120880112
-DEFAULT_SELF_DESTRUCT_TIME = 30
+BOT_TOKEN = "8339151235:AAHWAVBU0E0BFS9OGncjYXQwdU8XqHY83aQ"
+ADMIN_IDS = [2120880112, 6357014606]
+DEFAULT_SELF_DESTRUCT_TIME = 15
 
 
+# جداول جدید برای تنظیمات تبلیغاتی
 def init_db():
     conn = sqlite3.connect("file_bot.db")
     cursor = conn.cursor()
 
+    # جداول قبلی
     cursor.execute(
         """
     CREATE TABLE IF NOT EXISTS files (
@@ -87,6 +94,68 @@ def init_db():
     """
     )
 
+    # جداول جدید برای تبلیغات
+    cursor.execute(
+        """
+    CREATE TABLE IF NOT EXISTS ad_settings (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        setting_key TEXT UNIQUE NOT NULL,
+        setting_value TEXT,
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    )
+    """
+    )
+
+    cursor.execute(
+        """
+    CREATE TABLE IF NOT EXISTS forced_view (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        entity_type TEXT NOT NULL,
+        entity_id INTEGER NOT NULL,
+        channel_post_url TEXT NOT NULL,
+        view_time INTEGER DEFAULT 10,
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    )
+    """
+    )
+
+    cursor.execute(
+        """
+    CREATE TABLE IF NOT EXISTS caption_ads (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        ad_text TEXT NOT NULL,
+        is_active INTEGER DEFAULT 1,
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    )
+    """
+    )
+
+    cursor.execute(
+        """
+    CREATE TABLE IF NOT EXISTS glass_buttons (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        button_text TEXT NOT NULL,
+        button_url TEXT NOT NULL,
+        is_active INTEGER DEFAULT 1,
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    )
+    """
+    )
+
+    cursor.execute(
+        """
+    CREATE TABLE IF NOT EXISTS banner_ads (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        banner_type TEXT NOT NULL,
+        banner_content TEXT NOT NULL,
+        banner_file_id TEXT,
+        display_time INTEGER DEFAULT 10,
+        is_active INTEGER DEFAULT 1,
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    )
+    """
+    )
+
     conn.commit()
     conn.close()
 
@@ -123,6 +192,7 @@ async def settings_menu_from_query(query, context):
 
     keyboard = [
         [InlineKeyboardButton("⚙️ تخریب خودکار", callback_data="auto_destruct")],
+        [InlineKeyboardButton("🔒 قفل", callback_data="lock_settings")],
         [InlineKeyboardButton("🔙 بازگشت", callback_data="back_to_main")],
     ]
     reply_markup = InlineKeyboardMarkup(keyboard)
@@ -267,6 +337,31 @@ async def handle_simple_lock(query, data, context):
     )
 
 
+async def prompt_user_to_join_channels(update: Update, context, required_channels):
+    # اگر قبلاً پیام هشدار ارسال شده بود، چیزی نفرست
+    if context.user_data.get("prompt_message_id"):
+        return
+
+    keyboard = [
+        [InlineKeyboardButton(f"🔗 {ch}", url=f"https://t.me/{ch.lstrip('@')}")]
+        for ch in required_channels
+    ]
+    keyboard.append(
+        [InlineKeyboardButton("✅ چک دوباره عضویت", callback_data="check_channels")]
+    )
+    reply_markup = InlineKeyboardMarkup(keyboard)
+
+    message = update.callback_query.message if update.callback_query else update.message
+
+    sent_msg = await message.reply_text(
+        "⚠️ برای دسترسی به این فایل ابتدا باید عضو چنل‌های مشخص شده شوید.",
+        reply_markup=reply_markup,
+    )
+
+    # ذخیره ID پیام هشدار برای حذف بعدی
+    context.user_data["prompt_message_id"] = sent_msg.message_id
+
+
 async def handle_channels_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if "waiting_for_channels" not in context.user_data:
         return
@@ -322,66 +417,164 @@ async def check_user_channels(user_id, required_channels, context):
     return True
 
 
+async def check_membership_via_api(user_id: int, channels: list[str]) -> bool:
+    """
+    بررسی عضویت کاربر در کانال‌ها با تماس به secure_bot API
+    """
+    url = "http://127.0.0.1:8000/check_user"
+    headers = {"x-api-key": "supersecret"}
+    payload = {"user_id": user_id, "channels": channels}
+
+    async with aiohttp.ClientSession() as session:
+        async with session.post(url, json=payload, headers=headers) as resp:
+            if resp.status != 200:
+                return False  # خطا در ارتباط با API
+            data = await resp.json()
+            return data.get("status") == "yes"
+
+
+async def delete_prompt_after_delay(context, chat_id, message_id, delay=15):
+    """حذف پیام درخواست عضویت پس از تاخیر مشخص"""
+    try:
+        await asyncio.sleep(delay)
+        await context.bot.delete_message(chat_id=chat_id, message_id=message_id)
+
+        # پاک کردن فقط اطلاعات پیام prompt از context، نه اطلاعات entity
+        if "prompt_message_id" in context.user_data:
+            context.user_data.pop("prompt_message_id", None)
+        if "prompt_chat_id" in context.user_data:
+            context.user_data.pop("prompt_chat_id", None)
+        if "prompt_message_sent" in context.user_data:
+            context.user_data.pop("prompt_message_sent", None)
+
+    except Exception as e:
+        logging.error(f"Error deleting prompt message: {e}")
+
+
 async def prompt_user_to_join_channels(update: Update, context, required_channels):
     """
-    نمایش پیام هشدار برای کاربر که باید عضو چنل‌ها شود
-    همراه با دکمه‌های شیشه‌ای برای رفتن به چنل‌ها و چک دوباره عضویت
+    نمایش پیام هشدار با دکمه‌ها فقط یک بار
     """
-    keyboard = []
-    for ch in required_channels:
-        keyboard.append(
-            [InlineKeyboardButton(f"🔗 {ch}", url=f"https://t.me/{ch.lstrip('@')}")]
-        )
+    # اگر قبلاً پیام هشدار ارسال شده بود، چیزی نفرست
+    if context.user_data.get("prompt_message_sent"):
+        return
 
+    keyboard = [
+        [InlineKeyboardButton(f"🔗 {ch}", url=f"https://t.me/{ch.lstrip('@')}")]
+        for ch in required_channels
+    ]
     keyboard.append(
         [InlineKeyboardButton("✅ چک دوباره عضویت", callback_data="check_channels")]
     )
     reply_markup = InlineKeyboardMarkup(keyboard)
 
-    await update.message.reply_text(
-        "⚠️ برای دسترسی به این فایل ابتدا باید عضو چنل‌های مشخص شده شوید.",
+    # تشخیص نوع update
+    if update.callback_query:
+        message = update.callback_query.message
+    else:
+        message = update.message
+
+    sent_msg = await message.reply_text(
+        "⚠️ برای دسترسی به این فایل ابتدا باید عضو چنل‌های مشخص شده شوید.\n\n"
+        "⏰ این پیام به طور خودکار پس از 15 ثانیه حذف خواهد شد.",
         reply_markup=reply_markup,
+    )
+
+    # ثبت اینکه پیام هشدار ارسال شده و ذخیره ID آن
+    context.user_data["prompt_message_sent"] = True
+    context.user_data["prompt_message_id"] = sent_msg.message_id
+    context.user_data["prompt_chat_id"] = sent_msg.chat.id
+
+    # شروع تایمر برای حذف خودکار پیام
+    asyncio.create_task(
+        delete_prompt_after_delay(context, sent_msg.chat.id, sent_msg.message_id)
     )
 
 
 async def handle_check_channels(update: Update, context):
     query = update.callback_query
     await query.answer()
-
-    # بازیابی required_channels از context یا دیتابیس
     user_id = query.from_user.id
 
-    # فرض می‌کنیم entity_id و type در context ذخیره شده
-    if "lock_entity" not in context.user_data:
-        await query.message.edit_text("❌ خطا: اطلاعات فایل یا آرشیو یافت نشد.")
+    # بازیابی اطلاعات entity از context (اگر وجود دارد)
+    entity_info = context.user_data.get("lock_entity")
+    if not entity_info:
+        await query.answer("❌ خطا: اطلاعات فایل یا آرشیو یافت نشد.", show_alert=True)
         return
 
-    entity_info = context.user_data["lock_entity"]
     required_channels = get_required_channels(entity_info["type"], entity_info["id"])
 
-    is_member = await check_user_channels(user_id, required_channels, context)
+    # بررسی عضویت
+    is_member = await check_membership_via_api(user_id, required_channels)
 
     if is_member:
-        await query.message.edit_text(
-            "✅ شما اکنون عضو همه چنل‌های لازم هستید. می‌توانید فایل را دریافت کنید."
-        )
+        await query.answer("✅ شما اکنون عضو همه چنل‌های لازم هستید.", show_alert=True)
+
+        # حذف پیام درخواست عضویت (اگر وجود دارد)
+        if (
+            "prompt_message_id" in context.user_data
+            and "prompt_chat_id" in context.user_data
+        ):
+            try:
+                await context.bot.delete_message(
+                    chat_id=context.user_data["prompt_chat_id"],
+                    message_id=context.user_data["prompt_message_id"],
+                )
+            except Exception as e:
+                logging.error(f"Error deleting prompt message: {e}")
+
+        # حذف پیام اصلی که حاوی دکمه‌هاست (پیام callback)
+        try:
+            await query.message.delete()
+        except Exception as e:
+            logging.error(f"Error deleting query message: {e}")
+
+        # پاک کردن فقط اطلاعات پیام prompt از context، نه اطلاعات entity
+        context.user_data.pop("prompt_message_id", None)
+        context.user_data.pop("prompt_chat_id", None)
+        context.user_data.pop("prompt_message_sent", None)
+
+        # ارسال فایل یا آرشیو
+        conn = sqlite3.connect("file_bot.db")
+        cursor = conn.cursor()
+        if entity_info["type"] == "file":
+            cursor.execute(
+                "SELECT id, file_id, file_name, file_type, caption, caption_entities, self_destruct FROM files WHERE id = ?",
+                (entity_info["id"],),
+            )
+            file_data = cursor.fetchone()
+            if file_data:
+                await send_single_file(update, context, file_data)
+            else:
+                # اگر فایل پیدا نشد، همچنان اطلاعات entity را حفظ نکن
+                context.user_data.pop("lock_entity", None)
+                await query.message.reply_text("❌ فایل مورد نظر یافت نشد.")
+        elif entity_info["type"] == "archive":
+            cursor.execute(
+                "SELECT archive_code FROM archives WHERE id = ?", (entity_info["id"],)
+            )
+            archive_row = cursor.fetchone()
+            if archive_row:
+                await send_archive_files(update, context, archive_row[0])
+            else:
+                # اگر آرشیو پیدا نشد، همچنان اطلاعات entity را حفظ نکن
+                context.user_data.pop("lock_entity", None)
+                await query.message.reply_text("❌ آرشیو مورد نظر یافت نشد.")
+        conn.close()
+
+        # پس از ارسال محتوا، اطلاعات entity را پاک کنید
+        context.user_data.pop("lock_entity", None)
+
     else:
-        await query.message.edit_text(
-            "⚠️ هنوز عضو همه چنل‌ها نیستید. لطفاً ابتدا عضو شوید."
+        # نمایش alert فوری
+        await query.answer(
+            "⚠️ هنوز عضو همه چنل‌ها نیستید. لطفاً ابتدا عضو شوید و دوباره تلاش کنید.",
+            show_alert=True,
         )
-        # دوباره دکمه‌ها را نمایش می‌دهیم
-        keyboard = [
-            [InlineKeyboardButton(f"🔗 {ch}", url=f"https://t.me/{ch.lstrip('@')}")]
-            for ch in required_channels
-        ]
-        keyboard.append(
-            [InlineKeyboardButton("✅ چک دوباره عضویت", callback_data="check_channels")]
-        )
-        reply_markup = InlineKeyboardMarkup(keyboard)
-        await query.message.reply_text(
-            "⚠️ برای دسترسی به این فایل ابتدا باید عضو چنل‌های مشخص شده شوید.",
-            reply_markup=reply_markup,
-        )
+
+        # فقط اگر پیام هشدار اصلی هنوز وجود ندارد، پیام با دکمه‌ها را بفرست
+        if not context.user_data.get("prompt_message_sent"):
+            await prompt_user_to_join_channels(update, context, required_channels)
 
 
 async def show_file_settings(query):
@@ -648,14 +841,17 @@ async def handle_time_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def self_destruct_messages(chat_id, message_ids, context, delay_seconds):
-    await asyncio.sleep(delay_seconds)
-
     try:
+        await asyncio.sleep(delay_seconds)
+
         for msg_id in message_ids:
             try:
                 await context.bot.delete_message(chat_id=chat_id, message_id=msg_id)
             except Exception as e:
-                logging.error(f"Error deleting message {msg_id}: {e}")
+                # اگر پیام قبلاً حذف شده، خطا را نادیده بگیر
+                if "message to delete not found" not in str(e).lower():
+                    logging.error(f"Error deleting message {msg_id}: {e}")
+
     except Exception as e:
         logging.error(f"Error in self_destruct: {e}")
 
@@ -960,11 +1156,11 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await send_single_file(update, context, file_data)
 
             if self_destruct:
-                warning_msg = (
-                    f"⚠️ این فایل دارای تخریب خودکار است!\n\n"
-                    "📌 لطفاً بلافاصله فایل را به Saved Messages خود منتقل کنید تا از دست نرود."
-                )
-                await update.message.reply_text(warning_msg)
+                # warning_msg = (
+                #     f"⚠️ این فایل دارای تخریب خودکار است!\n\n"
+                #     "📌 لطفاً بلافاصله فایل را به Saved Messages خود منتقل کنید تا از دست نرود."
+                # )
+                pass
         else:
             await update.message.reply_text("❌ فایل مورد نظر یافت نشد.")
 
@@ -1095,8 +1291,8 @@ async def handle_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
     conn = sqlite3.connect("file_bot.db")
     cursor = conn.cursor()
     cursor.execute(
-        "INSERT INTO files (file_id, file_name, file_type, caption, caption_entities, unique_code, archive_id) "
-        "VALUES (?, ?, ?, ?, ?, ?, ?)",
+        "INSERT INTO files (file_id, file_name, file_type, caption, caption_entities, unique_code, archive_id, self_destruct) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
         (
             file_id,
             file_name,
@@ -1105,6 +1301,7 @@ async def handle_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
             entities_blob,
             unique_code,
             archive_id,
+            1,  # فعال کردن تخریب خودکار به طور پیش‌فرض
         ),
     )
     conn.commit()

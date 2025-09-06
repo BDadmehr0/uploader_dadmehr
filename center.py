@@ -1,7 +1,7 @@
 # secure_bot.py
-from fastapi import FastAPI, HTTPException, Header
-from pydantic import BaseModel
 import requests
+from fastapi import FastAPI, Header, HTTPException
+from pydantic import BaseModel
 
 # تنظیمات
 API_TOKEN = "8005785657:AAHg3xlrCjQQz8hBSeXK-YXn94DzrmOwWac"  # توکن ربات مرکزی
@@ -9,9 +9,11 @@ SECRET_KEY = "supersecret"  # برای احراز هویت ربات‌های آ�
 
 app = FastAPI()
 
+
 class CheckUserRequest(BaseModel):
     user_id: int
     channels: list[str]  # لیست کانال‌ها از اپلودر
+
 
 def is_user_member(user_id: int, channel_id: str):
     """بررسی عضویت کاربر در یک کانال خاص"""
@@ -22,6 +24,7 @@ def is_user_member(user_id: int, channel_id: str):
     print(resp)
     return member
 
+
 @app.post("/check_user")
 def check_user(req: CheckUserRequest, x_api_key: str = Header(...)):
     if x_api_key != SECRET_KEY:
@@ -31,5 +34,5 @@ def check_user(req: CheckUserRequest, x_api_key: str = Header(...)):
     for channel in req.channels:
         if not is_user_member(req.user_id, channel):
             return {"status": "no"}  # اگر در یکی عضو نبود، خروجی "no"
-    
+
     return {"status": "yes"}  # در همه کانال‌ها عضو است
