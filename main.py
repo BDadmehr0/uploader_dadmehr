@@ -3,15 +3,18 @@ import logging
 import pickle
 import sqlite3
 import uuid
+import aiohttp
 import re
 
-import aiohttp
 from telegram import (
     InlineKeyboardButton,
     InlineKeyboardMarkup,
     KeyboardButton,
     ReplyKeyboardMarkup,
     Update,
+    InputMediaPhoto,
+    InputMediaVideo,
+    InputMediaDocument,
 )
 from telegram.ext import (
     Application,
@@ -31,11 +34,12 @@ ADMIN_IDS = [2120880112, 6357014606]
 DEFAULT_SELF_DESTRUCT_TIME = 15
 
 
+# جداول جدید برای تنظیمات تبلیغاتی
 def init_db():
     conn = sqlite3.connect("file_bot.db")
     cursor = conn.cursor()
 
-    # Existing table creations...
+    # جدول فایل‌ها
     cursor.execute(
         """
     CREATE TABLE IF NOT EXISTS files (
@@ -54,6 +58,7 @@ def init_db():
     """
     )
 
+    # جدول آرشیو
     cursor.execute(
         """
     CREATE TABLE IF NOT EXISTS archives (
@@ -66,6 +71,7 @@ def init_db():
     """
     )
 
+    # تنظیمات عمومی (مثلا برای خودتخریبی)
     cursor.execute(
         """
     CREATE TABLE IF NOT EXISTS settings (
@@ -78,6 +84,7 @@ def init_db():
     """
     )
 
+    # قفل کانال (عضویت اجباری)
     cursor.execute(
         """
     CREATE TABLE IF NOT EXISTS locks (
@@ -90,22 +97,7 @@ def init_db():
     """
     )
 
-    # Add this new table for forced view settings
-    cursor.execute(
-        """
-    CREATE TABLE IF NOT EXISTS forced_view (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        entity_type TEXT NOT NULL,
-        entity_id INTEGER NOT NULL,
-        channel_post_url TEXT NOT NULL,
-        view_time INTEGER DEFAULT 10,
-        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-        UNIQUE(entity_type, entity_id)
-    )
-    """
-    )
-
-    # Add tables for advertisement settings if they don't exist
+    # تبلیغات
     cursor.execute(
         """
     CREATE TABLE IF NOT EXISTS ad_settings (
@@ -122,7 +114,7 @@ def init_db():
     CREATE TABLE IF NOT EXISTS caption_ads (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         ad_text TEXT NOT NULL,
-        is_active INTEGER DEFAULT 0,
+        is_active INTEGER DEFAULT 1,
         created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
     )
     """
@@ -134,7 +126,7 @@ def init_db():
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         button_text TEXT NOT NULL,
         button_url TEXT NOT NULL,
-        is_active INTEGER DEFAULT 0,
+        is_active INTEGER DEFAULT 1,
         created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
     )
     """
@@ -145,17 +137,35 @@ def init_db():
     CREATE TABLE IF NOT EXISTS banner_ads (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         banner_type TEXT NOT NULL,
-        banner_content TEXT,
+        banner_content TEXT NOT NULL,
         banner_file_id TEXT,
         display_time INTEGER DEFAULT 10,
-        is_active INTEGER DEFAULT 0,
+        is_active INTEGER DEFAULT 1,
         created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    )
+    """
+    )
+
+    # 🔹 جدول جدید برای سین اجباری (Forced View)
+    cursor.execute(
+        """
+    CREATE TABLE IF NOT EXISTS forced_view_settings (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        entity_type TEXT NOT NULL,
+        entity_id INTEGER NOT NULL,
+        channel_id TEXT NOT NULL,
+        channel_username TEXT NOT NULL,
+        post_url TEXT NOT NULL,
+        view_time INTEGER DEFAULT 10,
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        UNIQUE(entity_type, entity_id)
     )
     """
     )
 
     conn.commit()
     conn.close()
+
 
 def is_admin(user_id):
     return user_id in ADMIN_IDS
@@ -198,6 +208,46 @@ async def settings_menu_from_query(query, context):
         "تنظیمات - لطفاً گزینه مورد نظر را انتخاب کنید:", reply_markup=reply_markup
     )
 
+async def list_forced_view_settings(query):
+    conn = sqlite3.connect("file_bot.db")
+    cursor = conn.cursor()
+    
+    cursor.execute("""
+        SELECT fvs.entity_type, fvs.entity_id, fvs.channel_username, fvs.post_url,
+               CASE 
+                   WHEN fvs.entity_type = 'file' THEN f.file_name
+                   WHEN fvs.entity_type = 'archive' THEN a.archive_name
+               END as entity_name
+        FROM forced_view_settings fvs
+        LEFT JOIN files f ON fvs.entity_type = 'file' AND fvs.entity_id = f.id
+        LEFT JOIN archives a ON fvs.entity_type = 'archive' AND fvs.entity_id = a.id
+    """)
+    
+    settings = cursor.fetchall()
+    conn.close()
+    
+    if not settings:
+        keyboard = [[InlineKeyboardButton("🔙 بازگشت", callback_data="forced_view_settings")]]
+        reply_markup = InlineKeyboardMarkup(keyboard)
+        await query.message.edit_text(
+            "❌ هیچ تنظیمات سین اجباری وجود ندارد.",
+            reply_markup=reply_markup
+        )
+        return
+    
+    message = "📋 لیست تنظیمات سین اجباری:\n\n"
+    
+    for setting in settings:
+        entity_type, entity_id, channel_username, post_url, entity_name = setting
+        message += f"📌 {entity_name} ({'فایل' if entity_type == 'file' else 'آرشیو'})\n"
+        message += f"🔗 کانال: {channel_username}\n"
+        message += f"📎 پست: {post_url}\n"
+        message += f"🗑 /delete_forced_view_{entity_type}_{entity_id}\n\n"
+    
+    keyboard = [[InlineKeyboardButton("🔙 بازگشت", callback_data="forced_view_settings")]]
+    reply_markup = InlineKeyboardMarkup(keyboard)
+    
+    await query.message.edit_text(message, reply_markup=reply_markup)
 
 async def handle_settings_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
@@ -210,6 +260,7 @@ async def handle_settings_callback(update: Update, context: ContextTypes.DEFAULT
 
     data = query.data
 
+    # 🔹 تخریب خودکار
     if data == "auto_destruct":
         keyboard = [
             [InlineKeyboardButton("⚙️ فایل‌ها", callback_data="settings_file")],
@@ -222,6 +273,7 @@ async def handle_settings_callback(update: Update, context: ContextTypes.DEFAULT
             reply_markup=reply_markup,
         )
 
+    # 🔹 قفل ساده
     elif data == "lock_settings":
         keyboard = [
             [InlineKeyboardButton("🔒 قفل ساده", callback_data="simple_lock")],
@@ -236,6 +288,7 @@ async def handle_settings_callback(update: Update, context: ContextTypes.DEFAULT
     elif data == "simple_lock":
         await show_simple_lock(query)
 
+    # 🔹 تنظیمات فایل و آرشیو
     elif data == "settings_file":
         await show_file_settings(query)
     elif data == "settings_archive":
@@ -267,11 +320,26 @@ async def handle_settings_callback(update: Update, context: ContextTypes.DEFAULT
         archive_id = int(data[16:])
         await disable_self_destruct_archive(query, archive_id)
 
-    elif data.startswith("set_time_"):
-        await handle_set_time(query, data, context)
-
+    # 🔹 قفل ساده روی فایل یا آرشیو
     elif data.startswith("lock_file_") or data.startswith("lock_archive_"):
         await handle_simple_lock(query, data, context)
+
+    # 🔹 تبلیغات
+    elif data == "ad_settings":
+        await handle_ad_settings(query)
+    elif data == "back_to_ad_settings":
+        await handle_ad_settings(query)
+
+    # 🔹 سین اجباری
+    elif data == "forced_view_settings":
+        await handle_forced_view_settings(query)
+    elif data == "add_forced_view":
+        await add_forced_view(update, context)
+    elif data == "list_forced_view":
+        await list_forced_view_settings(query)
+    elif data.startswith("force_view_file_") or data.startswith("force_view_archive_"):
+        await handle_force_view_selection(query, data, context)
+
 
 
 async def show_simple_lock(query):
@@ -386,60 +454,6 @@ async def handle_channels_input(update: Update, context: ContextTypes.DEFAULT_TY
     del context.user_data["lock_entity"]
 
     await update.message.reply_text("قفل ساده با موفقیت اعمال شد.")
-
-
-def set_forced_view_settings(entity_type, entity_id, channel_post_url, view_time):
-    conn = sqlite3.connect("file_bot.db")
-    cursor = conn.cursor()
-    cursor.execute(
-        "INSERT OR REPLACE INTO forced_view (entity_type, entity_id, channel_post_url, view_time) VALUES (?, ?, ?, ?)",
-        (entity_type, entity_id, channel_post_url, view_time),
-    )
-    conn.commit()
-    conn.close()
-
-
-def get_ad_setting(key, default=None):
-    conn = sqlite3.connect("file_bot.db")
-    cursor = conn.cursor()
-    cursor.execute(
-        "SELECT setting_value FROM ad_settings WHERE setting_key = ?", (key,)
-    )
-    result = cursor.fetchone()
-    conn.close()
-    return result[0] if result else default
-
-
-def get_active_caption_ad():
-    conn = sqlite3.connect("file_bot.db")
-    cursor = conn.cursor()
-    cursor.execute("SELECT ad_text FROM caption_ads WHERE is_active = 1 LIMIT 1")
-    result = cursor.fetchone()
-    conn.close()
-    return result[0] if result else None
-
-
-def get_active_glass_button():
-    conn = sqlite3.connect("file_bot.db")
-    cursor = conn.cursor()
-    cursor.execute(
-        "SELECT button_text, button_url FROM glass_buttons WHERE is_active = 1 LIMIT 1"
-    )
-    result = cursor.fetchone()
-    conn.close()
-    return result if result else ("دکمه", "https://t.me/example")
-
-
-def get_active_banner_ad(banner_type):
-    conn = sqlite3.connect("file_bot.db")
-    cursor = conn.cursor()
-    cursor.execute(
-        "SELECT banner_content, banner_file_id, display_time FROM banner_ads WHERE banner_type = ? AND is_active = 1 LIMIT 1",
-        (banner_type,),
-    )
-    result = cursor.fetchone()
-    conn.close()
-    return result if result else (None, None, 10)
 
 
 def get_required_channels(entity_type, entity_id):
@@ -907,29 +921,6 @@ async def self_destruct_messages(chat_id, message_ids, context, delay_seconds):
         logging.error(f"Error in self_destruct: {e}")
 
 
-def set_ad_setting(key, value):
-    conn = sqlite3.connect("file_bot.db")
-    cursor = conn.cursor()
-    cursor.execute(
-        "INSERT OR REPLACE INTO ad_settings (setting_key, setting_value) VALUES (?, ?)",
-        (key, value),
-    )
-    conn.commit()
-    conn.close()
-
-
-def get_forced_view_settings(entity_type, entity_id):
-    conn = sqlite3.connect("file_bot.db")
-    cursor = conn.cursor()
-    cursor.execute(
-        "SELECT channel_post_url, view_time FROM forced_view WHERE entity_type = ? AND entity_id = ?",
-        (entity_type, entity_id),
-    )
-    result = cursor.fetchone()
-    conn.close()
-    return result if result else (None, 10)
-
-
 def get_self_destruct_time(entity_type, entity_id):
     conn = sqlite3.connect("file_bot.db")
     cursor = conn.cursor()
@@ -958,349 +949,34 @@ def is_self_destruct_enabled(entity_type, entity_id):
     return result[0] if result else 0
 
 
-# پنل مدیریت تبلیغات
-async def ad_settings_panel(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = update.effective_user.id
-    if not is_admin(user_id):
-        await update.message.reply_text("شما دسترسی به این بخش را ندارید.")
-        return
-
-    keyboard = [
-        [InlineKeyboardButton("📺 سین اجباری", callback_data="ad_forced_view")],
-        [InlineKeyboardButton("🔤 قفل کپشن", callback_data="ad_caption_lock")],
-        [InlineKeyboardButton("🔘 دکمه شیشه‌ای", callback_data="ad_glass_button")],
-        [InlineKeyboardButton("🖼 بنری", callback_data="ad_banner")],
-        [InlineKeyboardButton("🔙 بازگشت", callback_data="back_to_main")],
-    ]
-    reply_markup = InlineKeyboardMarkup(keyboard)
-
-    await update.message.reply_text(
-        "تنظیمات تبلیغات - گزینه مورد نظر را انتخاب کنید:", reply_markup=reply_markup
-    )
-
-
-# مدیریت سین اجباری
-async def handle_forced_view_settings(
-    update: Update, context: ContextTypes.DEFAULT_TYPE
-):
-    query = update.callback_query
-    await query.answer()
-
-    user_id = query.from_user.id
-    if not is_admin(user_id):
-        await query.message.reply_text("شما دسترسی به این بخش را ندارید.")
-        return
-
-    # نمایش فایل‌ها و آرشیوها برای تنظیم سین اجباری
-    conn = sqlite3.connect("file_bot.db")
-    cursor = conn.cursor()
-
-    cursor.execute("SELECT id, file_name FROM files ORDER BY id DESC LIMIT 10")
-    files = cursor.fetchall()
-
-    cursor.execute("SELECT id, archive_name FROM archives ORDER BY id DESC LIMIT 10")
-    archives = cursor.fetchall()
-
-    conn.close()
-
-    keyboard = []
-    for file in files:
-        file_id, file_name = file
-        keyboard.append(
-            [
-                InlineKeyboardButton(
-                    f"📁 {file_name}", callback_data=f"forced_file_{file_id}"
-                )
-            ]
-        )
-
-    for archive in archives:
-        archive_id, archive_name = archive
-        keyboard.append(
-            [
-                InlineKeyboardButton(
-                    f"📦 {archive_name}", callback_data=f"forced_archive_{archive_id}"
-                )
-            ]
-        )
-
-    keyboard.append([InlineKeyboardButton("🔙 بازگشت", callback_data="ad_settings")])
-
-    reply_markup = InlineKeyboardMarkup(keyboard)
-    await query.message.edit_text(
-        "سین اجباری - انتخاب فایل یا آرشیو:", reply_markup=reply_markup
-    )
-
-
-# پردازش انتخاب برای سین اجباری
-async def handle_forced_entity_selection(
-    update: Update, context: ContextTypes.DEFAULT_TYPE
-):
-    query = update.callback_query
-    await query.answer()
-
-    data = query.data
-    if data.startswith("forced_file_"):
-        entity_type = "file"
-        entity_id = int(data[12:])
-    else:
-        entity_type = "archive"
-        entity_id = int(data[15:])
-
-    context.user_data["forced_view_entity"] = {"type": entity_type, "id": entity_id}
-    context.user_data["waiting_for_channel_post"] = True
-
-    await query.message.edit_text(
-        "لطفاً لینک پست کانال را ارسال کنید:\n\n" "مثال: https://t.me/channel/123"
-    )
-
-
-# پردازش لینک پست کانال و زمان مورد نیاز
-async def handle_channel_post_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = update.effective_user.id
-    if not is_admin(user_id):
-        await update.message.reply_text("شما دسترسی به این بخش را ندارید.")
-        return
-
-    if "waiting_for_channel_post" not in context.user_data:
-        return
-
-    channel_post_url = update.message.text.strip()
-
-    # اعتبارسنجی لینک
-    if not re.match(r"https?://t\.me/\w+/\d+", channel_post_url):
-        await update.message.reply_text(
-            "لینک وارد شده معتبر نیست. لطفاً یک لینک معتبر ارسال کنید."
-        )
-        return
-
-    context.user_data["channel_post_url"] = channel_post_url
-    context.user_data["waiting_for_channel_post"] = False
-    context.user_data["waiting_for_view_time"] = True
-
-    await update.message.reply_text(
-        "لطفاً زمان مورد نیاز برای مشاهده پست را به ثانیه وارد کنید:\n\n"
-        "مثال: 10 (برای 10 ثانیه)"
-    )
-
-
-# پردازش زمان مشاهده
-async def handle_view_time_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = update.effective_user.id
-    if not is_admin(user_id):
-        await update.message.reply_text("شما دسترسی به این بخش را ندارید.")
-        return
-
-    if "waiting_for_view_time" not in context.user_data:
-        return
-
-    try:
-        view_time = int(update.message.text.strip())
-        if view_time < 5:
-            await update.message.reply_text("زمان باید حداقل 5 ثانیه باشد.")
-            return
-
-        entity_info = context.user_data["forced_view_entity"]
-        channel_post_url = context.user_data["channel_post_url"]
-
-        set_forced_view_settings(
-            entity_info["type"], entity_info["id"], channel_post_url, view_time
-        )
-
-        # پاک کردن داده‌های موقت
-        del context.user_data["forced_view_entity"]
-        del context.user_data["channel_post_url"]
-        del context.user_data["waiting_for_view_time"]
-
-        await update.message.reply_text("تنظیمات سین اجباری با موفقیت ذخیره شد!")
-
-    except ValueError:
-        await update.message.reply_text("لطفاً یک عدد معتبر وارد کنید.")
-
-
-# بررسی سین اجباری قبل از ارسال فایل
-async def check_forced_view(
-    update: Update, context: ContextTypes.DEFAULT_TYPE, entity_type, entity_id
-):
-    channel_post_url, view_time = get_forced_view_settings(entity_type, entity_id)
-
-    if not channel_post_url:
-        return True  # اگر سین اجباری تنظیم نشده باشد
-
-    user_id = update.effective_user.id
-    context.user_data["pending_entity"] = {"type": entity_type, "id": entity_id}
-    context.user_data["view_time_required"] = view_time
-    context.user_data["view_start_time"] = asyncio.get_event_loop().time()
-
-    # ایجاد دکمه برای مشاهده پست
-    keyboard = [
-        [InlineKeyboardButton("👀 مشاهده پست", url=channel_post_url)],
-        [InlineKeyboardButton("✅ نگاه کردم", callback_data="view_confirmed")],
-    ]
-    reply_markup = InlineKeyboardMarkup(keyboard)
-
-    message = await update.message.reply_text(
-        f"⚠️ برای دریافت فایل، لطفاً ابتدا پست زیر را به مدت {view_time} ثانیه مشاهده کنید:\n\n"
-        f"{channel_post_url}",
-        reply_markup=reply_markup,
-    )
-
-    context.user_data["view_message_id"] = message.message_id
-    return False
-
-
-# پردازش تأیید مشاهده
-async def handle_view_confirmation(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
-
-    user_id = query.from_user.id
-    view_start_time = context.user_data.get("view_start_time", 0)
-    view_time_required = context.user_data.get("view_time_required", 10)
-    elapsed_time = asyncio.get_event_loop().time() - view_start_time
-
-    if elapsed_time < view_time_required:
-        remaining_time = int(view_time_required - elapsed_time)
-        await query.answer(
-            f"⚠️ شما باید حداقل {view_time_required} ثانیه پست را مشاهده کنید. {remaining_time} ثانیه باقی مانده.",
-            show_alert=True,
-        )
-        return
-
-    entity_info = context.user_data.get("pending_entity")
-    if not entity_info:
-        await query.answer("خطا در پردازش درخواست.", show_alert=True)
-        return
-
-    # حذف پیام درخواست مشاهده
-    try:
-        await context.bot.delete_message(
-            chat_id=query.message.chat_id,
-            message_id=context.user_data["view_message_id"],
-        )
-    except:
-        pass
-
-    # ارسال فایل یا آرشیو
-    if entity_info["type"] == "file":
-        conn = sqlite3.connect("file_bot.db")
-        cursor = conn.cursor()
-        cursor.execute(
-            "SELECT id, file_id, file_name, file_type, caption, caption_entities, self_destruct FROM files WHERE id = ?",
-            (entity_info["id"],),
-        )
-        file_data = cursor.fetchone()
-        conn.close()
-
-        if file_data:
-            await send_single_file(update, context, file_data)
-    else:
-        conn = sqlite3.connect("file_bot.db")
-        cursor = conn.cursor()
-        cursor.execute(
-            "SELECT archive_code FROM archives WHERE id = ?", (entity_info["id"],)
-        )
-        archive_data = cursor.fetchone()
-        conn.close()
-
-        if archive_data:
-            await send_archive_files(update, context, archive_data[0])
-
-    # پاک کردن داده‌های موقت
-    keys_to_remove = [
-        "pending_entity",
-        "view_time_required",
-        "view_start_time",
-        "view_message_id",
-    ]
-    for key in keys_to_remove:
-        context.user_data.pop(key, None)
-
-
-# اضافه کردن تبلیغ به کپشن
-def add_ad_to_caption(original_caption):
-    ad_text = get_active_caption_ad()
-    if not ad_text:
-        return original_caption
-
-    if original_caption:
-        return f"{original_caption}\n\n{ad_text}"
-    else:
-        return ad_text
-
-
-# اضافه کردن دکمه شیشه‌ای
-def add_glass_button():
-    button_text, button_url = get_active_glass_button()
-    return InlineKeyboardMarkup([[InlineKeyboardButton(button_text, url=button_url)]])
-
-
-# ارسال بنر تبلیغاتی
-async def send_banner_ad(
-    update: Update, context: ContextTypes.DEFAULT_TYPE, banner_type
-):
-    banner_content, banner_file_id, display_time = get_active_banner_ad(banner_type)
-
-    if not banner_content and not banner_file_id:
-        return None
-
-    try:
-        if banner_file_id:
-            # اگر بنر یک فایل است
-            if banner_type == "before":
-                message = await context.bot.send_document(
-                    chat_id=update.effective_chat.id,
-                    document=banner_file_id,
-                    caption=banner_content,
-                )
-            else:
-                message = await context.bot.send_document(
-                    chat_id=update.effective_chat.id,
-                    document=banner_file_id,
-                    caption=banner_content,
-                )
-        else:
-            # اگر بنر یک متن است
-            message = await context.bot.send_message(
-                chat_id=update.effective_chat.id, text=banner_content
-            )
-
-        # حذف خودکار بنر بعد از زمان مشخص
-        if display_time > 0:
-            asyncio.create_task(
-                self_destruct_messages(
-                    update.effective_chat.id,
-                    [message.message_id],
-                    context,
-                    display_time,
-                )
-            )
-
-        return message
-
-    except Exception as e:
-        logging.error(f"Error sending banner ad: {e}")
-        return None
-
-
 async def send_single_file(
     update: Update, context: ContextTypes.DEFAULT_TYPE, file_data
 ):
     file_db_id = file_data[0]
     file_id = file_data[1]
 
-    # بررسی سین اجباری
-    if not await check_forced_view(update, context, "file", file_db_id):
+    # 🔹 بررسی سین اجباری
+    can_access = await check_forced_view(
+        update.effective_user.id,
+        "file",
+        file_db_id,
+        context,
+        update
+    )
+    if not can_access:
         return
 
-    # ارسال بنر قبل از فایل
-    await send_banner_ad(update, context, "before")
+    # 🔹 بررسی عضویت در کانال‌های اجباری
+    required_channels = get_required_channels("file", file_db_id)
+    if required_channels and not await check_user_channels(
+        update.effective_user.id, required_channels, context
+    ):
+        await prompt_user_to_join_channels(update, context, required_channels)
+        return
 
+    # مشخصات فایل
     file_type = file_data[3]
-    original_caption = file_data[4] or ""
-
-    # اضافه کردن تبلیغ به کپشن
-    caption = add_ad_to_caption(original_caption)
+    caption = file_data[4] or ""
 
     caption_entities = None
     if file_data[5] and isinstance(file_data[5], (bytes, bytearray)):
@@ -1308,9 +984,6 @@ async def send_single_file(
             caption_entities = pickle.loads(file_data[5])
         except Exception as e:
             logging.error(f"Error loading caption entities: {e}")
-
-    # اضافه کردن دکمه شیشه‌ای
-    reply_markup = add_glass_button()
 
     message = None
     try:
@@ -1320,7 +993,6 @@ async def send_single_file(
                 document=file_id,
                 caption=caption,
                 caption_entities=caption_entities,
-                reply_markup=reply_markup,
             )
         elif file_type == "video":
             message = await context.bot.send_video(
@@ -1329,7 +1001,6 @@ async def send_single_file(
                 caption=caption,
                 caption_entities=caption_entities,
                 has_spoiler=True,
-                reply_markup=reply_markup,
             )
         elif file_type == "audio":
             message = await context.bot.send_audio(
@@ -1337,7 +1008,6 @@ async def send_single_file(
                 audio=file_id,
                 caption=caption,
                 caption_entities=caption_entities,
-                reply_markup=reply_markup,
             )
         elif file_type == "photo":
             message = await context.bot.send_photo(
@@ -1346,9 +1016,9 @@ async def send_single_file(
                 caption=caption,
                 caption_entities=caption_entities,
                 has_spoiler=True,
-                reply_markup=reply_markup,
             )
 
+        # 🔹 بررسی خودتخریبی فایل
         if message and is_self_destruct_enabled("file", file_db_id):
             destruct_time = get_self_destruct_time("file", file_db_id)
             asyncio.create_task(
@@ -1364,34 +1034,46 @@ async def send_single_file(
         logging.error(f"Error sending file: {e}")
         await update.message.reply_text("⚠️ خطا در ارسال فایل.")
 
-    # ارسال بنر بعد از فایل
-    await send_banner_ad(update, context, "after")
-
-
-# تغییرات در تابع ارسال آرشیو
 async def send_archive_files(
     update: Update, context: ContextTypes.DEFAULT_TYPE, archive_code
 ):
     conn = sqlite3.connect("file_bot.db")
     cursor = conn.cursor()
 
+    # گرفتن اطلاعات آرشیو
     cursor.execute(
         "SELECT id, archive_name FROM archives WHERE archive_code = ?", (archive_code,)
     )
     archive_data = cursor.fetchone()
     if not archive_data:
         await update.message.reply_text("آرشیو مورد نظر یافت نشد.")
+        conn.close()
         return
 
     archive_id, archive_name = archive_data
 
-    # بررسی سین اجباری
-    if not await check_forced_view(update, context, "archive", archive_id):
+    # 🔹 بررسی سین اجباری
+    can_access = await check_forced_view(
+        update.effective_user.id,
+        "archive",
+        archive_id,
+        context,
+        update
+    )
+    if not can_access:
+        conn.close()
         return
 
-    # ارسال بنر قبل از آرشیو
-    await send_banner_ad(update, context, "before")
+    # 🔹 بررسی عضویت در کانال‌های اجباری
+    required_channels = get_required_channels("archive", archive_id)
+    if required_channels and not await check_user_channels(
+        update.effective_user.id, required_channels, context
+    ):
+        await prompt_user_to_join_channels(update, context, required_channels)
+        conn.close()
+        return
 
+    # گرفتن فایل‌های آرشیو
     cursor.execute(
         "SELECT * FROM files WHERE archive_id = ? ORDER BY id", (archive_id,)
     )
@@ -1402,16 +1084,15 @@ async def send_archive_files(
         await update.message.reply_text("هیچ فایلی در این آرشیو یافت نشد.")
         return
 
+    # پیام خوشامد آرشیو
     welcome_msg = await update.message.reply_text(f"📦 آرشیو: {archive_name}")
     message_ids = [welcome_msg.message_id]
 
+    # ارسال فایل‌ها
     for file_data in files_data:
         file_id = file_data[1]
         file_type = file_data[3]
-        original_caption = file_data[4] or ""
-
-        # اضافه کردن تبلیغ به کپشن
-        caption = add_ad_to_caption(original_caption)
+        caption = file_data[4] or ""
 
         caption_entities = None
         if file_data[5]:
@@ -1420,9 +1101,6 @@ async def send_archive_files(
             except Exception as e:
                 logging.error(f"Error loading caption entities: {e}")
 
-        # اضافه کردن دکمه شیشه‌ای
-        reply_markup = add_glass_button()
-
         try:
             if file_type == "document":
                 msg = await context.bot.send_document(
@@ -1430,7 +1108,6 @@ async def send_archive_files(
                     document=file_id,
                     caption=caption,
                     caption_entities=caption_entities,
-                    reply_markup=reply_markup,
                 )
             elif file_type == "video":
                 msg = await context.bot.send_video(
@@ -1439,7 +1116,6 @@ async def send_archive_files(
                     caption=caption,
                     caption_entities=caption_entities,
                     has_spoiler=True,
-                    reply_markup=reply_markup,
                 )
             elif file_type == "audio":
                 msg = await context.bot.send_audio(
@@ -1447,7 +1123,6 @@ async def send_archive_files(
                     audio=file_id,
                     caption=caption,
                     caption_entities=caption_entities,
-                    reply_markup=reply_markup,
                 )
             elif file_type == "photo":
                 msg = await context.bot.send_photo(
@@ -1456,7 +1131,6 @@ async def send_archive_files(
                     caption=caption,
                     caption_entities=caption_entities,
                     has_spoiler=True,
-                    reply_markup=reply_markup,
                 )
 
             message_ids.append(msg.message_id)
@@ -1465,6 +1139,7 @@ async def send_archive_files(
             logging.error(f"Error sending file: {e}")
             await update.message.reply_text("خطا در ارسال فایل.")
 
+    # 🔹 بررسی خودتخریبی
     if is_self_destruct_enabled("archive", archive_id):
         destruct_time = get_self_destruct_time("archive", archive_id)
         asyncio.create_task(
@@ -1472,9 +1147,6 @@ async def send_archive_files(
                 update.effective_chat.id, message_ids, context, destruct_time
             )
         )
-
-    # ارسال بنر بعد از آرشیو
-    await send_banner_ad(update, context, "after")
 
 
 async def admin_panel_from_query(query, context):
@@ -1537,6 +1209,7 @@ async def handle_settings_button(update: Update, context: ContextTypes.DEFAULT_T
     keyboard = [
         [InlineKeyboardButton("⚙️ تخریب خودکار", callback_data="auto_destruct")],
         [InlineKeyboardButton("🔒 قفل", callback_data="lock_settings")],
+        [InlineKeyboardButton("📢 تبلیغات", callback_data="ad_settings")],  # اضافه کردن تبلیغات
         [InlineKeyboardButton("🔙 بازگشت", callback_data="back_to_main")],
     ]
     reply_markup = InlineKeyboardMarkup(keyboard)
@@ -1545,6 +1218,20 @@ async def handle_settings_button(update: Update, context: ContextTypes.DEFAULT_T
         "تنظیمات - لطفاً گزینه مورد نظر را انتخاب کنید:", reply_markup=reply_markup
     )
 
+async def handle_ad_settings(query):
+    keyboard = [
+        [InlineKeyboardButton("🔍 سین اجباری", callback_data="forced_view_settings")],
+        [InlineKeyboardButton("📝 تبلیغات کپشن", callback_data="caption_ads")],
+        [InlineKeyboardButton("🔘 دکمه شیشه‌ای", callback_data="glass_buttons")],
+        [InlineKeyboardButton("🖼 بنر تبلیغاتی", callback_data="banner_ads")],
+        [InlineKeyboardButton("🔙 بازگشت", callback_data="back_to_settings")]
+    ]
+    reply_markup = InlineKeyboardMarkup(keyboard)
+    
+    await query.message.edit_text(
+        "تنظیمات تبلیغات - گزینه مورد نظر را انتخاب کنید:",
+        reply_markup=reply_markup
+    )
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
@@ -1855,79 +1542,299 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     else:
         await update.message.reply_text("لطفاً از منوی مدیریت استفاده کنید.")
 
+async def show_ad_settings_menu(query):
+    keyboard = [
+        [InlineKeyboardButton("🔍 سین اجباری", callback_data="forced_view_settings")],
+        [InlineKeyboardButton("📝 تبلیغات کپشن", callback_data="caption_ads")],
+        [InlineKeyboardButton("🔘 دکمه شیشه‌ای", callback_data="glass_buttons")],
+        [InlineKeyboardButton("🖼 بنر تبلیغاتی", callback_data="banner_ads")],
+        [InlineKeyboardButton("🔙 بازگشت", callback_data="back_to_settings")]
+    ]
+    reply_markup = InlineKeyboardMarkup(keyboard)
+    
+    await query.message.edit_text(
+        "تنظیمات تبلیغات - گزینه مورد نظر را انتخاب کنید:",
+        reply_markup=reply_markup
+    )
+
+
+async def handle_forced_view_settings(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+
+    keyboard = [
+        [InlineKeyboardButton("➕ افزودن سین اجباری", callback_data="add_forced_view")],
+        [InlineKeyboardButton("📋 لیست تنظیمات", callback_data="list_forced_view")],
+        [InlineKeyboardButton("🔙 بازگشت", callback_data="back_to_ad_settings")]
+    ]
+    reply_markup = InlineKeyboardMarkup(keyboard)
+
+    await query.message.edit_text(
+        "تنظیمات سین اجباری - گزینه مورد نظر را انتخاب کنید:",
+        reply_markup=reply_markup
+    )
+
+
+# افزودن سین اجباری
+async def add_forced_view(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    
+    # نمایش فایل‌ها و آرشیوها برای انتخاب
+    conn = sqlite3.connect("file_bot.db")
+    cursor = conn.cursor()
+    
+    cursor.execute("SELECT id, file_name FROM files ORDER BY id DESC LIMIT 10")
+    files = cursor.fetchall()
+    
+    cursor.execute("SELECT id, archive_name FROM archives ORDER BY id DESC LIMIT 10")
+    archives = cursor.fetchall()
+    
+    conn.close()
+    
+    keyboard = []
+    for file in files:
+        file_id, file_name = file
+        keyboard.append([
+            InlineKeyboardButton(
+                f"📁 {file_name}", 
+                callback_data=f"force_view_file_{file_id}"
+            )
+        ])
+    
+    for archive in archives:
+        archive_id, archive_name = archive
+        keyboard.append([
+            InlineKeyboardButton(
+                f"📦 {archive_name}", 
+                callback_data=f"force_view_archive_{archive_id}"
+            )
+        ])
+    
+    keyboard.append([InlineKeyboardButton("🔙 بازگشت", callback_data="forced_view_settings")])
+    
+    reply_markup = InlineKeyboardMarkup(keyboard)
+    await query.message.edit_text(
+        "انتخاب فایل یا آرشیو برای سین اجباری:",
+        reply_markup=reply_markup
+    )
+
+# پردازش انتخاب فایل/آرشیو برای سین اجباری
+async def handle_force_view_selection(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+
+    data = query.data
+    if data.startswith("force_view_file_"):
+        entity_type = "file"
+        entity_id = int(data[16:])
+    else:
+        entity_type = "archive"
+        entity_id = int(data[19:])
+
+    # ذخیره موقت برای دریافت آیدی کانال
+    context.user_data["forced_view_entity"] = {
+        "type": entity_type,
+        "id": entity_id
+    }
+    context.user_data["waiting_for_channel_simple_id"] = True
+
+    await query.message.edit_text(
+        "لطفاً آیدی کانال را ارسال کنید تا دسترسی به این محتوا فعال شود:"
+    )
+
+
+# پردازش اطلاعات کانال
+async def handle_channel_info_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if "waiting_for_channel_simple_id" not in context.user_data:
+        return
+
+    channel_id = update.message.text.strip()  # حالا یک رشته ساده است
+    entity_info = context.user_data["forced_view_entity"]
+
+    # ذخیره در دیتابیس
+    conn = sqlite3.connect("file_bot.db")
+    cursor = conn.cursor()
+
+    # حذف تنظیمات قبلی اگر وجود دارد
+    cursor.execute(
+        "DELETE FROM forced_view_settings WHERE entity_type = ? AND entity_id = ?",
+        (entity_info["type"], entity_info["id"])
+    )
+
+    # افزودن تنظیمات جدید (فقط آیدی کانال به شکل رشته)
+    cursor.execute(
+        "INSERT INTO forced_view_settings (entity_type, entity_id, channel_id, channel_username, post_url) "
+        "VALUES (?, ?, ?, '', '')",
+        (entity_info["type"], entity_info["id"], channel_id)
+    )
+
+    conn.commit()
+    conn.close()
+
+    del context.user_data["waiting_for_channel_simple_id"]
+    del context.user_data["forced_view_entity"]
+
+    await update.message.reply_text("✅ تنظیمات سین اجباری با موفقیت ذخیره شد.")
+
+# بررسی سین اجباری قبل از ارسال فایل
+async def check_forced_view(user_id, entity_type, entity_id, context, update):
+    conn = sqlite3.connect("file_bot.db")
+    cursor = conn.cursor()
+    cursor.execute(
+        "SELECT channel_id FROM forced_view_settings WHERE entity_type = ? AND entity_id = ?",
+        (entity_type, entity_id)
+    )
+    setting = cursor.fetchone()
+    conn.close()
+
+    if not setting:
+        return True  # هیچ سین اجباری نیست
+
+    channel_id = setting[0]
+
+    # کلید برای بررسی تأیید کاربر
+    user_verified_key = f"forced_view_verified_{user_id}_{entity_type}_{entity_id}"
+    if context.user_data.get(user_verified_key):
+        return True  # قبلاً تأیید شده
+
+    # اگر تأیید نشده، پیام بده
+    keyboard = [
+        [InlineKeyboardButton("✅ تأیید مشاهده", callback_data=f"confirm_view_{entity_type}_{entity_id}")]
+    ]
+    reply_markup = InlineKeyboardMarkup(keyboard)
+
+    message_text = (
+        f"⚠️ برای دسترسی به این محتوا، باید ابتدا سین انجام شود.\n\n"
+        f"🔗 کانال: {channel_id}\n"
+        "📌 پس از مشاهده کانال، روی دکمه 'تأیید مشاهده' کلیک کنید."
+    )
+
+    if update.callback_query:
+        await update.callback_query.message.reply_text(message_text, reply_markup=reply_markup)
+    else:
+        await update.message.reply_text(message_text, reply_markup=reply_markup)
+
+    return False
+
+
+
+# نمایش پیام سین اجباری با دکمه‌های شیشه‌ای
+async def show_forced_view_prompt(update, context, channel_username, post_url, entity_type, entity_id):
+    keyboard = [
+        [InlineKeyboardButton("🔗 مشاهده پست", url=post_url)],
+        [InlineKeyboardButton("✅ تأیید مشاهده", callback_data=f"confirm_view_{entity_type}_{entity_id}")]
+    ]
+    reply_markup = InlineKeyboardMarkup(keyboard)
+    
+    message_text = (
+        "⚠️ برای دسترسی به این محتوا، باید در کانال عضو شده و پست مشخص شده را مشاهده کنید.\n\n"
+        f"🔗 کانال: {channel_username}\n"
+        "📌 پس از مشاهده پست، روی دکمه 'تأیید مشاهده' کلیک کنید."
+    )
+    
+    if update.callback_query:
+        await update.callback_query.message.reply_text(message_text, reply_markup=reply_markup)
+    else:
+        await update.message.reply_text(message_text, reply_markup=reply_markup)
+
+# پردازش تأیید مشاهده
+async def handle_confirm_view(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    
+    data = query.data
+    entity_type = data.split('_')[2]
+    entity_id = int(data.split('_')[3])
+    
+    user_id = query.from_user.id
+    
+    # ذخیره تأیید کاربر
+    user_verified_key = f"forced_view_verified_{user_id}_{entity_type}_{entity_id}"
+    context.user_data[user_verified_key] = True
+    
+    # حذف پیام درخواست
+    await query.message.delete()
+    
+    # ارسال محتوا
+    if entity_type == "file":
+        conn = sqlite3.connect("file_bot.db")
+        cursor = conn.cursor()
+        cursor.execute(
+            "SELECT * FROM files WHERE id = ?", (entity_id,)
+        )
+        file_data = cursor.fetchone()
+        conn.close()
+        
+        if file_data:
+            await send_single_file(update, context, file_data)
+    else:
+        conn = sqlite3.connect("file_bot.db")
+        cursor = conn.cursor()
+        cursor.execute(
+            "SELECT archive_code FROM archives WHERE id = ?", (entity_id,)
+        )
+        archive_data = cursor.fetchone()
+        conn.close()
+        
+        if archive_data:
+            await send_archive_files(update, context, archive_data[0])
+
 
 def main():
     init_db()
 
     application = Application.builder().token(BOT_TOKEN).build()
 
-    # هندلرهای موجود
-    application.add_handler(
-        CallbackQueryHandler(handle_check_channels, pattern="^check_channels$")
-    )
-    application.add_handler(
-        MessageHandler(filters.Regex("⚙️ تنظیمات"), handle_settings_button)
-    )
+    # =========================
+    # 🔹 هندلرهای سین اجباری
+    # =========================
+    application.add_handler(CallbackQueryHandler(handle_forced_view_settings, pattern="^forced_view_settings$"))
+    application.add_handler(CallbackQueryHandler(add_forced_view, pattern="^add_forced_view$"))
+    application.add_handler(CallbackQueryHandler(handle_force_view_selection, pattern="^force_view_(file|archive)_"))
+    application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_channel_info_input), group=3)
+    application.add_handler(CallbackQueryHandler(handle_confirm_view, pattern="^confirm_view_(file|archive)_"))
+
+    # =========================
+    # 🔹 هندلرهای تبلیغات
+    # =========================
+    application.add_handler(CallbackQueryHandler(handle_check_channels, pattern="^check_channels$"))
+
+    # =========================
+    # 🔹 هندلرهای تنظیمات
+    # =========================
+    application.add_handler(MessageHandler(filters.Regex("⚙️ تنظیمات"), handle_settings_button))
     application.add_handler(CallbackQueryHandler(handle_settings_callback))
-    application.add_handler(
-        MessageHandler(filters.TEXT & ~filters.COMMAND, handle_time_input), group=1
-    )
-    application.add_handler(
-        MessageHandler(filters.TEXT & ~filters.COMMAND, handle_channels_input), group=2
-    )
+    application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_time_input), group=1)
+    application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_channels_input), group=2)
 
-    # هندلرهای جدید برای تبلیغات
-    application.add_handler(
-        MessageHandler(filters.Regex("📢 تبلیغات"), ad_settings_panel)
-    )
-    application.add_handler(
-        CallbackQueryHandler(handle_forced_view_settings, pattern="^ad_forced_view$")
-    )
-    application.add_handler(
-        CallbackQueryHandler(
-            handle_forced_entity_selection, pattern="^forced_(file|archive)_"
-        )
-    )
-    application.add_handler(
-        MessageHandler(filters.TEXT & ~filters.COMMAND, handle_channel_post_input),
-        group=3,
-    )
-    application.add_handler(
-        MessageHandler(filters.TEXT & ~filters.COMMAND, handle_view_time_input), group=4
-    )
-    application.add_handler(
-        CallbackQueryHandler(handle_view_confirmation, pattern="^view_confirmed$")
-    )
-
-    # هندلرهای باقی مانده
+    # =========================
+    # 🔹 دستورات عمومی
+    # =========================
     application.add_handler(CommandHandler("start", start))
     application.add_handler(CommandHandler("admin", admin_panel))
+
+    # =========================
+    # 🔹 مدیریت آرشیو و فایل‌ها
+    # =========================
+    application.add_handler(CallbackQueryHandler(handle_archive_callback, pattern="^(new_archive|open_arc_)"))
     application.add_handler(
-        CallbackQueryHandler(
-            handle_archive_callback, pattern="^(new_archive|open_arc_)"
-        )
-    )
-    application.add_handler(
-        MessageHandler(
-            filters.Document.ALL | filters.PHOTO | filters.VIDEO | filters.AUDIO,
-            handle_file,
-        )
+        MessageHandler(filters.Document.ALL | filters.PHOTO | filters.VIDEO | filters.AUDIO, handle_file)
     )
     application.add_handler(MessageHandler(filters.Regex("📋 لیست فایل‌ها"), list_files))
     application.add_handler(MessageHandler(filters.Regex("🗑 حذف فایل"), delete_file))
-    application.add_handler(
-        MessageHandler(filters.Regex("📦 آرشیو پست"), start_create_archive)
-    )
-    application.add_handler(
-        MessageHandler(filters.Regex("👥 مدیریت ادمین‌ها"), manage_admins)
-    )
-    application.add_handler(
-        MessageHandler(filters.Regex("📤 آپلود فایل جدید"), start_file_upload)
-    )
-    application.add_handler(
-        MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text)
-    )
+    application.add_handler(MessageHandler(filters.Regex("📦 آرشیو پست"), start_create_archive))
+    application.add_handler(MessageHandler(filters.Regex("👥 مدیریت ادمین‌ها"), manage_admins))
+    application.add_handler(MessageHandler(filters.Regex("📤 آپلود فایل جدید"), start_file_upload))
 
+    # =========================
+    # 🔹 هندلر پیش‌فرض (متن‌ها)
+    # =========================
+    application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
+
+    # =========================
+    # 🔹 اجرای ربات
+    # =========================
     application.run_polling()
 
 
